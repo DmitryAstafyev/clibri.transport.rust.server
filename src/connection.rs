@@ -3,7 +3,7 @@ use super::{
     errors::Error,
     server::MonitorEvent,
 };
-use fiber::{env::logs, server};
+use clibri::{env::logs, server};
 use futures::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use tokio::{

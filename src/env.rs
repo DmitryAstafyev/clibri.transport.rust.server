@@ -1,7 +1,7 @@
 use std::env::var_os;
 
 mod constants {
-    pub const DEBUG_MODE: &str = "FIBER_WS_SERVER_DEBUG_MODE";
+    pub const DEBUG_MODE: &str = "clibri_WS_SERVER_DEBUG_MODE";
 }
 pub fn is_debug_mode() -> bool {
     if let Some(mode) = var_os(constants::DEBUG_MODE) {
