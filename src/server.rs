@@ -488,6 +488,8 @@ impl Server {
                                         error!(target: logs::targets::SERVER, "{}:: Fail to close connection due error: {}", uuid, e);
                                         tx_events.send(server::Events::Error(Some(uuid), format!("{}", e))).map_err(|e| Error::Channel(e.to_string()))?;
                                     } else { stat.sent_bytes(len); }
+                                } else {
+                                    error!(target: logs::targets::SERVER, "Fail to find a client {}", uuid);
                                 }
                             } else {
                                 for (uuid, control) in controlls.iter_mut() {
@@ -506,7 +508,7 @@ impl Server {
                         InternalChannel::Disconnect(uuid, tx_resolve) => {
                             if let Some(uuid) = uuid.as_ref() {
                                 // Disconnect client
-                                if let Some(control) = controlls.get(&uuid) {
+                                if let Some(control) = controlls.get(uuid) {
                                     let (tx_shutdown_resolve, rx_shutdown_resolve): (oneshot::Sender<()>, oneshot::Receiver<()>) = oneshot::channel();
                                     if let Err(e) = control.send(ConnectionControl::Disconnect(tx_shutdown_resolve)) {
                                         error!(target: logs::targets::SERVER, "{}:: Fail to send close connection command due error: {}", uuid, e);

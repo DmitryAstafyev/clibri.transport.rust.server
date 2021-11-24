@@ -7,6 +7,7 @@ use clibri::{env::logs, server};
 use futures::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use tokio::{
+    join,
     net::TcpStream,
     select,
     sync::{
@@ -23,6 +24,7 @@ use tokio_tungstenite::{
     },
     WebSocketStream,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 enum State {
@@ -43,7 +45,7 @@ impl Connection {
 
     pub async fn attach(
         &mut self,
-        mut ws: WebSocketStream<TcpStream>,
+        ws: WebSocketStream<TcpStream>,
         events: UnboundedSender<server::Events<Error>>,
         messages: UnboundedSender<Messages>,
         monitor: Option<UnboundedSender<(u16, MonitorEvent)>>,
@@ -52,7 +54,6 @@ impl Connection {
         let (tx_control, mut rx_control): (UnboundedSender<Control>, UnboundedReceiver<Control>) =
             unbounded_channel();
         let uuid = self.uuid;
-        let mut state: Option<State> = None;
         let incomes_task_events = events.clone();
         let send_event = move |event: server::Events<Error>| {
             if let Err(e) = incomes_task_events.send(event) {
@@ -89,86 +90,124 @@ impl Connection {
         };
         spawn(async move {
             let mut shutdown_resolver: Option<oneshot::Sender<()>> = None;
-            loop {
-                select! {
-                    msg = ws.next() => {
-                        let msg = if let Some(msg) = msg {
-                            msg
-                        } else {
-                            continue;
-                        };
+            let (mut writer, mut reader) = ws.split();
+            let stop_reading = CancellationToken::new();
+            let stop_reading_emitter = stop_reading.clone();
+            let stop_writing = CancellationToken::new();
+            let stop_writing_emitter = stop_writing.clone();
+            let ((writer, writer_state), (reader, mut reader_state)) = join!(
+                async {
+                    while let Some(msg) = select! {
+                        msg = reader.next() => msg,
+                        _ = stop_reading.cancelled() => None,
+                    } {
                         let msg = match msg {
                             Ok(msg) => msg,
-                            Err(e) => {
-                                if let TungsteniteError::Protocol(ref e) = e {
-                                    if e == &ProtocolError::ResetWithoutClosingHandshake {
-                                        debug!(target: logs::targets::SERVER, "{}:: Client disconnected without closing handshake", uuid);
-                                        state = Some(State::DisconnectByClientWithError(format!("{}", e)));
+                            Err(err) => {
+                                if let TungsteniteError::Protocol(ref err) = err {
+                                    if err == &ProtocolError::ResetWithoutClosingHandshake {
+                                        debug!(
+                                            target: logs::targets::SERVER,
+                                            "{}:: Client disconnected without closing handshake",
+                                            uuid
+                                        );
+                                        stop_writing_emitter.cancel();
+                                        return (
+                                            reader,
+                                            Some(State::DisconnectByClientWithError(
+                                                err.to_string(),
+                                            )),
+                                        );
                                     }
                                 }
-                                if state.is_none() {
-                                    warn!(target: logs::targets::SERVER, "{}:: Cannot get message. Error: {:?}", uuid, e);
-                                    send_event(server::Events::ConnectionError(
-                                        Some(uuid),
-                                        Error::InvalidMessage(format!("{}", e)),
-                                    ));
-                                    state = Some(State::Error(ChannelError::ReadSocket(format!("{}", e))));
-                                }
-                                break;
+                                warn!(
+                                    target: logs::targets::SERVER,
+                                    "{}:: Cannot get message. Error: {:?}", uuid, err
+                                );
+                                send_event(server::Events::ConnectionError(
+                                    Some(uuid),
+                                    Error::InvalidMessage(err.to_string()),
+                                ));
+                                stop_writing_emitter.cancel();
+                                return (
+                                    reader,
+                                    Some(State::Error(ChannelError::ReadSocket(err.to_string()))),
+                                );
                             }
                         };
                         match msg {
                             Message::Text(_) => {
-                                warn!(target: logs::targets::SERVER, "{}:: has been gotten not binnary data", uuid);
+                                warn!(
+                                    target: logs::targets::SERVER,
+                                    "{}:: has been gotten not binnary data", uuid
+                                );
                                 send_event(server::Events::ConnectionError(
                                     Some(uuid),
                                     Error::NonBinaryData,
                                 ));
                                 continue;
-                            },
+                            }
                             Message::Binary(buffer) => {
-                                info!(target: logs::targets::SERVER, "{}:: binary data {:?}", uuid, buffer);
-                                send_message(Messages::Binary {
-                                    uuid,
-                                    buffer,
-                                });
-                            },
+                                info!(
+                                    target: logs::targets::SERVER,
+                                    "{}:: binary data {:?}", uuid, buffer
+                                );
+                                send_message(Messages::Binary { uuid, buffer });
+                            }
                             Message::Ping(_) | Message::Pong(_) => {
                                 warn!(target: logs::targets::SERVER, "{}:: Ping / Pong", uuid);
-                            },
+                            }
                             Message::Close(close_frame) => {
-                                state = Some(State::DisconnectByClient(close_frame));
-                                break;
+                                stop_writing_emitter.cancel();
+                                return (reader, Some(State::DisconnectByClient(close_frame)));
                             }
                         }
-                    },
-                    cmd = rx_control.recv() => {
-                        let cmd = if let Some(cmd) = cmd {
-                            cmd
-                        } else {
-                            continue;
-                        };
+                    }
+                    stop_writing_emitter.cancel();
+                    (reader, None)
+                },
+                async {
+                    while let Some(cmd) = select! {
+                        cmd = rx_control.recv() => cmd,
+                        _ = stop_writing.cancelled() => None,
+                    } {
                         match cmd {
                             Control::Send(buffer) => {
-                                if let Err(e) = ws.send(Message::from(buffer)).await {
-                                    error!(target: logs::targets::SERVER, "{}:: Cannot send data to client. Error: {}", uuid, e);
-                                    state = Some(State::Error(ChannelError::WriteSocket(format!("{}", e))));
-                                    break;
+                                if let Err(err) = writer.send(Message::from(buffer)).await {
+                                    error!(
+                                        target: logs::targets::SERVER,
+                                        "{}:: Cannot send data to client. Error: {}", uuid, err
+                                    );
+                                    stop_reading_emitter.cancel();
+                                    return (
+                                        writer,
+                                        Some(State::Error(ChannelError::WriteSocket(
+                                            err.to_string(),
+                                        ))),
+                                    );
                                 }
-                            },
+                            }
                             Control::Disconnect(tx_shutdown_resolver) => {
                                 shutdown_resolver = Some(tx_shutdown_resolver);
-                                state = Some(State::DisconnectByServer);
-                                break;
-                            },
-                        }
+                                stop_reading_emitter.cancel();
+                                return (writer, Some(State::DisconnectByServer));
+                            }
+                        };
                     }
-                };
-            }
+                    stop_reading_emitter.cancel();
+                    (writer, None)
+                }
+            );
+
             debug!(
                 target: logs::targets::SERVER,
                 "{}:: exit from socket listening loop.", uuid
             );
+            let state: Option<State> = if let Some(state) = reader_state.take() {
+                Some(state)
+            } else {
+                writer_state
+            };
             if let Some(state) = state {
                 match state {
                     State::DisconnectByServer => {
@@ -196,28 +235,49 @@ impl Connection {
                     }
                 };
             }
-            match ws.close(None).await {
-                Ok(()) => {}
-                Err(e) => match e {
-                    TungsteniteError::AlreadyClosed | TungsteniteError::ConnectionClosed => {
-                        debug!(
-                            target: logs::targets::SERVER,
-                            "{}:: connection is already closed", uuid
-                        );
-                    }
-                    _ => {
-                        error!(
-                            target: logs::targets::SERVER,
-                            "{}:: fail to close connection", uuid
-                        );
-                        send_event(server::Events::ConnectionError(
-                            Some(uuid),
-                            Error::CloseConnection(format!("{}:: fail to close connection", uuid)),
-                        ));
-                    }
-                },
-            };
-            drop(ws);
+            match writer.reunite(reader) {
+                Ok(mut ws) => {
+                    match ws.close(None).await {
+                        Ok(()) => {}
+                        Err(e) => match e {
+                            TungsteniteError::AlreadyClosed
+                            | TungsteniteError::ConnectionClosed => {
+                                debug!(
+                                    target: logs::targets::SERVER,
+                                    "{}:: connection is already closed", uuid
+                                );
+                            }
+                            _ => {
+                                error!(
+                                    target: logs::targets::SERVER,
+                                    "{}:: fail to close connection", uuid
+                                );
+                                send_event(server::Events::ConnectionError(
+                                    Some(uuid),
+                                    Error::CloseConnection(format!(
+                                        "{}:: fail to close connection",
+                                        uuid
+                                    )),
+                                ));
+                            }
+                        },
+                    };
+                    drop(ws);
+                }
+                Err(err) => {
+                    error!(
+                        target: logs::targets::SERVER,
+                        "{}:: fail to close connection (reunite err: {})", uuid, err
+                    );
+                    send_event(server::Events::ConnectionError(
+                        Some(uuid),
+                        Error::CloseConnection(format!(
+                            "{}:: fail to close connection (reunite err: {})",
+                            uuid, err
+                        )),
+                    ));
+                }
+            }
             if let Some(monitor) = monitor.as_ref() {
                 if let Err(_err) = monitor.send((port, MonitorEvent::Disconnected)) {
                     error!(
