@@ -1,6 +1,6 @@
 [package]
 name = "clibri_transport_server"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["DmitryAstafyev <D.Astafyev@outlook.com>"]
 edition = "2018"
 description = "Based on websocket protocol server. Used for clibri project"
@@ -15,15 +15,15 @@ categories = ["network-programming"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clibri = "0.1.1"
-bytes = "1.0.1"
+clibri = "0.1.2"
+bytes = "1.1.0"
 uuid = { version = "0.8.2", features = ["v4"] }
-tokio = { version = "1.9.0", features = ["full"] }
+tokio = { version = "1.14.0", features = ["full"] }
 tokio-tungstenite = "0.16.0"
-futures = { version = "0.3.16" }
-thiserror = "1.0.26"
+futures = "0.3.18"
+thiserror = "1.0.30"
 log = "0.4.14"
 log4rs = "1.0.0"
-tokio-util = "0.6.7"
+tokio-util = "0.6.9"
 async-trait = "0.1.51"
-hyper = { version = "0.14.11", features = ["full"] }
+hyper = { version = "0.14.15", features = ["full"] }

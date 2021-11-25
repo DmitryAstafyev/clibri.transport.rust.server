@@ -23,7 +23,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     select,
     sync::{
-        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        mpsc::{channel, Receiver, Sender},
         oneshot,
     },
     task,
@@ -35,12 +35,21 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-type CreatePortListenerRequest = (u16, oneshot::Sender<()>);
-type PortSender = UnboundedSender<oneshot::Sender<Option<u16>>>;
-type PortReceiver = UnboundedReceiver<oneshot::Sender<Option<u16>>>;
-type MonitorSender = UnboundedSender<(u16, MonitorEvent)>;
-type MonitorReceiver = UnboundedReceiver<(u16, MonitorEvent)>;
+pub(crate) type CreatePortListenerRequest = (u16, oneshot::Sender<()>);
+pub(crate) type PortSender = Sender<oneshot::Sender<Option<u16>>>;
+pub(crate) type PortReceiver = Receiver<oneshot::Sender<Option<u16>>>;
+pub(crate) type MonitorSender = Sender<(u16, MonitorEvent)>;
+pub(crate) type MonitorReceiver = Receiver<(u16, MonitorEvent)>;
 
+pub(crate) mod channels {
+    pub const INTERNAL_API_CHANNEL: usize = 1000;
+    pub const SERVER_EVENTS: usize = 1000;
+    pub const MESSAGES_CHANNEL: usize = 1000;
+    pub const INCOME_STREAMS: usize = 100;
+    pub const MONITOR: usize = 100;
+    pub const PORT_REQUESTING: usize = 100;
+    pub const CONNECTION_CONTROL: usize = 10;
+}
 pub enum MonitorEvent {
     Connected,
     Disconnected,
@@ -55,11 +64,7 @@ enum InternalChannel {
     DelegatePort(oneshot::Sender<Option<u16>>),
     Insert(u16, (u32, CancellationToken), oneshot::Sender<()>),
     MonitorEvent(MonitorEvent, u16, oneshot::Sender<()>),
-    InsertControl(
-        Uuid,
-        UnboundedSender<ConnectionControl>,
-        oneshot::Sender<()>,
-    ),
+    InsertControl(Uuid, Sender<ConnectionControl>, oneshot::Sender<()>),
     RemoveControl(Uuid, oneshot::Sender<()>),
     Send(Vec<u8>, Option<Uuid>, oneshot::Sender<()>),
     Disconnect(Option<Uuid>, oneshot::Sender<()>),
@@ -110,7 +115,7 @@ impl server::Control<Error> for Control {
 
 #[derive(Clone)]
 struct InternalAPI {
-    tx_api: UnboundedSender<InternalChannel>,
+    tx_api: Sender<InternalChannel>,
     shutdown: CancellationToken,
     locked: CancellationToken,
 }
@@ -123,6 +128,7 @@ impl InternalAPI {
         ) = oneshot::channel();
         self.tx_api
             .send(InternalChannel::GetPort(tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::get_port; error: {}", e)))?;
         rx_resolve.await.map_err(|e| {
             Error::Channel(format!("Fail get response for api::get_port; error: {}", e))
@@ -136,6 +142,7 @@ impl InternalAPI {
         ) = oneshot::channel();
         self.tx_api
             .send(InternalChannel::DelegatePort(tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::delegate_port; error: {}", e)))?;
         rx_resolve.await.map_err(|e| {
             Error::Channel(format!(
@@ -150,6 +157,7 @@ impl InternalAPI {
             oneshot::channel();
         self.tx_api
             .send(InternalChannel::Insert(port, data, tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::insert; error: {}", e)))?;
         rx_resolve
             .await
@@ -161,6 +169,7 @@ impl InternalAPI {
             oneshot::channel();
         self.tx_api
             .send(InternalChannel::MonitorEvent(event, port, tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::monitor_event; error: {}", e)))?;
         rx_resolve.await.map_err(|e| {
             Error::Channel(format!(
@@ -173,12 +182,13 @@ impl InternalAPI {
     pub async fn insert_control(
         &self,
         uuid: Uuid,
-        tx_control: UnboundedSender<ConnectionControl>,
+        tx_control: Sender<ConnectionControl>,
     ) -> Result<(), Error> {
         let (tx_resolve, rx_resolve): (oneshot::Sender<()>, oneshot::Receiver<()>) =
             oneshot::channel();
         self.tx_api
             .send(InternalChannel::InsertControl(uuid, tx_control, tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::insert_control; error: {}", e)))?;
         rx_resolve.await.map_err(|e| {
             Error::Channel(format!(
@@ -193,6 +203,7 @@ impl InternalAPI {
             oneshot::channel();
         self.tx_api
             .send(InternalChannel::RemoveControl(uuid, tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::remove_control; error: {}", e)))?;
         rx_resolve.await.map_err(|e| {
             Error::Channel(format!(
@@ -207,6 +218,7 @@ impl InternalAPI {
             oneshot::channel();
         self.tx_api
             .send(InternalChannel::Send(buffer, uuid, tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::send; error: {}", e)))?;
         rx_resolve
             .await
@@ -218,6 +230,7 @@ impl InternalAPI {
             oneshot::channel();
         self.tx_api
             .send(InternalChannel::Disconnect(Some(uuid), tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::disconnect; error: {}", e)))?;
         rx_resolve.await.map_err(|e| {
             Error::Channel(format!(
@@ -232,6 +245,7 @@ impl InternalAPI {
             oneshot::channel();
         self.tx_api
             .send(InternalChannel::Disconnect(None, tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::disconnect; error: {}", e)))?;
         rx_resolve.await.map_err(|e| {
             Error::Channel(format!(
@@ -246,6 +260,7 @@ impl InternalAPI {
             oneshot::channel();
         self.tx_api
             .send(InternalChannel::PrintStat(tx_resolve))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::print_stat; error: {}", e)))?;
         rx_resolve.await.map_err(|e| {
             Error::Channel(format!(
@@ -255,21 +270,24 @@ impl InternalAPI {
         })
     }
 
-    pub fn stat_recieved_bytes(&self, bytes: usize) -> Result<(), Error> {
+    pub async fn stat_recieved_bytes(&self, bytes: usize) -> Result<(), Error> {
         self.tx_api
             .send(InternalChannel::StatRecievedBytes(bytes))
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::recieved_bytes; error: {}", e)))
     }
 
-    pub fn stat_listener_created(&self) -> Result<(), Error> {
+    pub async fn stat_listener_created(&self) -> Result<(), Error> {
         self.tx_api
             .send(InternalChannel::StatListenerCreated)
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::listener_created; error: {}", e)))
     }
 
-    pub fn stat_listener_destroyed(&self) -> Result<(), Error> {
+    pub async fn stat_listener_destroyed(&self) -> Result<(), Error> {
         self.tx_api
             .send(InternalChannel::StatListenerDestroyed)
+            .await
             .map_err(|e| {
                 Error::Channel(format!(
                     "Fail do api::stat_listener_destroyed; error: {}",
@@ -278,9 +296,10 @@ impl InternalAPI {
             })
     }
 
-    pub fn stat_connecting(&self) -> Result<(), Error> {
+    pub async fn stat_connecting(&self) -> Result<(), Error> {
         self.tx_api
             .send(InternalChannel::StatConnecting)
+            .await
             .map_err(|e| Error::Channel(format!("Fail do api::stat_connecting; error: {}", e)))
     }
 
@@ -299,11 +318,41 @@ impl InternalAPI {
     }
 }
 
+mod shortcuts {
+    use super::*;
+
+    pub async fn remove_control(
+        controlls: &mut HashMap<Uuid, Sender<ConnectionControl>>,
+        tx_events: &Sender<server::Events<Error>>,
+        stat: &mut Stat,
+        uuid: Uuid,
+    ) -> Result<(), Error> {
+        if controlls.remove(&uuid).is_some() {
+            stat.disconnected();
+            debug!(
+                target: logs::targets::SERVER,
+                "{}:: Channel of connection has been removed", uuid
+            );
+            stat.alive(controlls.len());
+            tx_events
+                .send(server::Events::Disconnected(uuid))
+                .await
+                .map_err(|e| Error::Channel(e.to_string()))?;
+        } else {
+            error!(
+                target: logs::targets::SERVER,
+                "{}:: Fail to find channel of connection to remove it", uuid
+            );
+        }
+        Ok(())
+    }
+}
+
 pub struct Server {
     options: Options,
-    tx_events: UnboundedSender<server::Events<Error>>,
-    rx_events: Option<UnboundedReceiver<server::Events<Error>>>,
-    rx_api: Option<UnboundedReceiver<InternalChannel>>,
+    tx_events: Sender<server::Events<Error>>,
+    rx_events: Option<Receiver<server::Events<Error>>>,
+    rx_api: Option<Receiver<InternalChannel>>,
     api: InternalAPI,
     control: Control,
 }
@@ -312,13 +361,11 @@ impl Server {
     pub fn new(options: Options) -> Self {
         env::logs::init();
         let (tx_events, rx_events): (
-            UnboundedSender<server::Events<Error>>,
-            UnboundedReceiver<server::Events<Error>>,
-        ) = unbounded_channel();
-        let (tx_api, rx_api): (
-            UnboundedSender<InternalChannel>,
-            UnboundedReceiver<InternalChannel>,
-        ) = unbounded_channel();
+            Sender<server::Events<Error>>,
+            Receiver<server::Events<Error>>,
+        ) = channel(channels::SERVER_EVENTS);
+        let (tx_api, rx_api): (Sender<InternalChannel>, Receiver<InternalChannel>) =
+            channel(channels::INTERNAL_API_CHANNEL);
         let api = InternalAPI {
             tx_api,
             shutdown: CancellationToken::new(),
@@ -336,31 +383,17 @@ impl Server {
 
     async fn api_task(
         &self,
-        mut rx_api: UnboundedReceiver<InternalChannel>,
+        mut rx_api: Receiver<InternalChannel>,
         options: Option<Distributor>,
         cancel: CancellationToken,
     ) -> Result<(), Error> {
         let mut connections: HashMap<u16, (u32, CancellationToken)> = HashMap::new();
-        let mut controlls: HashMap<Uuid, UnboundedSender<ConnectionControl>> = HashMap::new();
+        let mut controlls: HashMap<Uuid, Sender<ConnectionControl>> = HashMap::new();
         let mut stat: Stat = Stat::new();
         let tx_events = self.tx_events.clone();
         info!(target: logs::targets::SERVER, "[task: api]:: started");
         select! {
             res = async {
-                let remove_control = |
-                    controlls: &mut HashMap<Uuid, UnboundedSender<ConnectionControl>>,
-                    stat: &mut Stat,
-                    uuid: Uuid| {
-                    if controlls.remove(&uuid).is_some() {
-                        stat.disconnected();
-                        debug!(target: logs::targets::SERVER, "{}:: Channel of connection has been removed", uuid);
-                        stat.alive(controlls.len());
-                        tx_events.send(server::Events::Disconnected(uuid)).map_err(|e| Error::Channel(e.to_string()))?;
-                    } else {
-                        error!(target: logs::targets::SERVER, "{}:: Fail to find channel of connection to remove it", uuid);
-                    }
-                    Ok(())
-                };
                 while let Some(msg) = rx_api.recv().await {
                     match msg {
                         InternalChannel::GetPort(tx_resolve) => {
@@ -464,7 +497,7 @@ impl Server {
                             controlls.entry(uuid).or_insert(tx_control);
                             stat.connected();
                             stat.alive(controlls.len());
-                            tx_events.send(server::Events::Connected(uuid)).map_err(|e| Error::Channel(e.to_string()))?;
+                            tx_events.send(server::Events::Connected(uuid)).await.map_err(|e| Error::Channel(e.to_string()))?;
                             tx_resolve.send(()).map_err(|_| {
                                 Error::Channel(String::from(
                                     "Fail handle InternalChannel::InsertControl command",
@@ -473,7 +506,7 @@ impl Server {
                             debug!(target: logs::targets::SERVER, "Controll of connection has been added");
                         }
                         InternalChannel::RemoveControl(uuid, tx_resolve) => {
-                            remove_control(&mut controlls, &mut stat, uuid.to_owned())?;
+                            shortcuts::remove_control(&mut controlls, &tx_events, &mut stat, uuid.to_owned()).await?;
                             tx_resolve.send(()).map_err(|_| {
                                 Error::Channel(String::from(
                                     "Fail handle InternalChannel::RemoveControl command",
@@ -484,18 +517,18 @@ impl Server {
                             let len = buffer.len();
                             if let Some(uuid) = uuid {
                                 if let Some(control) = controlls.get_mut(&uuid) {
-                                    if let Err(e) = control.send(ConnectionControl::Send(buffer)) {
+                                    if let Err(e) = control.send(ConnectionControl::Send(buffer)).await {
                                         error!(target: logs::targets::SERVER, "{}:: Fail to close connection due error: {}", uuid, e);
-                                        tx_events.send(server::Events::Error(Some(uuid), format!("{}", e))).map_err(|e| Error::Channel(e.to_string()))?;
+                                        tx_events.send(server::Events::Error(Some(uuid), format!("{}", e))).await.map_err(|e| Error::Channel(e.to_string()))?;
                                     } else { stat.sent_bytes(len); }
                                 } else {
                                     error!(target: logs::targets::SERVER, "Fail to find a client {}", uuid);
                                 }
                             } else {
                                 for (uuid, control) in controlls.iter_mut() {
-                                    if let Err(e) = control.send(ConnectionControl::Send(buffer.clone())) {
+                                    if let Err(e) = control.send(ConnectionControl::Send(buffer.clone())).await {
                                         error!(target: logs::targets::SERVER, "{}:: Fail to close connection due error: {}", uuid, e);
-                                        tx_events.send(server::Events::Error(Some(*uuid), format!("{}", e))).map_err(|e| Error::Channel(e.to_string()))?;
+                                        tx_events.send(server::Events::Error(Some(*uuid), format!("{}", e))).await.map_err(|e| Error::Channel(e.to_string()))?;
                                     } else { stat.sent_bytes(len); }
                                 }
                             }
@@ -510,38 +543,41 @@ impl Server {
                                 // Disconnect client
                                 if let Some(control) = controlls.get(uuid) {
                                     let (tx_shutdown_resolve, rx_shutdown_resolve): (oneshot::Sender<()>, oneshot::Receiver<()>) = oneshot::channel();
-                                    if let Err(e) = control.send(ConnectionControl::Disconnect(tx_shutdown_resolve)) {
+                                    if let Err(e) = control.send(ConnectionControl::Disconnect(tx_shutdown_resolve)).await {
                                         error!(target: logs::targets::SERVER, "{}:: Fail to send close connection command due error: {}", uuid, e);
-                                        tx_events.send(server::Events::Error(Some(*uuid), format!("{}", e))).map_err(|e| Error::Channel(e.to_string()))?;
+                                        tx_events.send(server::Events::Error(Some(*uuid), format!("{}", e))).await.map_err(|e| Error::Channel(e.to_string()))?;
                                     } else if rx_shutdown_resolve.await.is_err() {
                                         error!(target: logs::targets::SERVER, "{}:: Fail get disconnect confirmation", uuid);
-                                        tx_events.send(server::Events::Error(Some(*uuid), String::from("Fail get disconnect confirmation"))).map_err(|e| Error::Channel(e.to_string()))?;
+                                        tx_events.send(server::Events::Error(Some(*uuid), String::from("Fail get disconnect confirmation"))).await.map_err(|e| Error::Channel(e.to_string()))?;
                                     }
-                                    remove_control(&mut controlls, &mut stat, uuid.to_owned())?;
+                                    shortcuts::remove_control(&mut controlls, &tx_events, &mut stat, uuid.to_owned()).await?;
                                 } else {
                                     error!(target: logs::targets::SERVER, "Command Disconnect has been gotten. But cannot find client: {}", uuid);
-                                    tx_events.send(server::Events::ServerError(Error::CreateWS(format!("Command Disconnect has been gotten. But cannot find client: {}", uuid)))).map_err(|e| Error::Channel(e.to_string()))?;
+                                    tx_events
+                                        .send(server::Events::ServerError(Error::CreateWS(format!("Command Disconnect has been gotten. But cannot find client: {}", uuid))))
+                                        .await
+                                        .map_err(|e| Error::Channel(e.to_string()))?;
                                 }
                             } else {
                                 // Disconnect all
                                 let mut uuids: Vec<Uuid> = vec![];
                                 for (uuid, control) in controlls.iter() {
                                     let (tx_shutdown_resolve, rx_shutdown_resolve): (oneshot::Sender<()>, oneshot::Receiver<()>) = oneshot::channel();
-                                    if let Err(e) = control.send(ConnectionControl::Disconnect(tx_shutdown_resolve)) {
+                                    if let Err(e) = control.send(ConnectionControl::Disconnect(tx_shutdown_resolve)).await {
                                         error!(target: logs::targets::SERVER, "{}:: Fail to send close connection command due error: {}", uuid, e);
-                                        if let Err(err) = tx_events.send(server::Events::Error(Some(*uuid), format!("{}", e))) {
+                                        if let Err(err) = tx_events.send(server::Events::Error(Some(*uuid), format!("{}", e))).await {
                                             error!(target: logs::targets::SERVER, "{}:: Cannot send event Error; error: {}", uuid, err);
                                         }
                                     } else if rx_shutdown_resolve.await.is_err() {
                                         error!(target: logs::targets::SERVER, "{}:: Fail get disconnect confirmation", uuid);
-                                        if let Err(err) = tx_events.send(server::Events::Error(Some(*uuid), String::from("Fail get disconnect confirmation"))) {
+                                        if let Err(err) = tx_events.send(server::Events::Error(Some(*uuid), String::from("Fail get disconnect confirmation"))).await {
                                             error!(target: logs::targets::SERVER, "{}:: Cannot send event Error; error: {}", uuid, err);
                                         }
                                     }
                                     uuids.push(uuid.to_owned());
                                 }
                                 for uuid in uuids {
-                                    remove_control(&mut controlls, &mut stat, uuid.to_owned())?;
+                                    shortcuts::remove_control(&mut controlls, &tx_events, &mut stat, uuid.to_owned()).await?;
                                 }
                             }
                             tx_resolve.send(()).map_err(|_| {
@@ -584,8 +620,8 @@ impl Server {
 
     async fn streams_task(
         addr: SocketAddr,
-        tx_tcp_stream: UnboundedSender<TcpStream>,
-        tx_events: UnboundedSender<server::Events<Error>>,
+        tx_tcp_stream: Sender<TcpStream>,
+        tx_events: Sender<server::Events<Error>>,
         api: InternalAPI,
         mut tx_listener_ready: Option<oneshot::Sender<()>>,
         cancel: CancellationToken,
@@ -593,7 +629,7 @@ impl Server {
         info!(target: logs::targets::SERVER, "[task: streams]:: started");
         let listener = match TcpListener::bind(addr).await {
             Ok(listener) => {
-                api.stat_listener_created()?;
+                api.stat_listener_created().await?;
                 debug!(
                     target: logs::targets::SERVER,
                     "server has been started on {}", addr
@@ -607,6 +643,7 @@ impl Server {
                 );
                 tx_events
                     .send(server::Events::ServerError(Error::Create(format!("{}", e))))
+                    .await
                     .map_err(|e| Error::Channel(e.to_string()))?;
                 return Err(Error::Create(format!("{}", e)));
             }
@@ -618,6 +655,7 @@ impl Server {
         } else {
             tx_events
                 .send(server::Events::Ready)
+                .await
                 .map_err(|e| Error::Channel(e.to_string()))?;
         }
         let res = select! {
@@ -626,19 +664,25 @@ impl Server {
                     let stream = match listener.accept().await {
                         Ok((stream, _addr)) => {
                             debug!(target: logs::targets::SERVER, "Getting request to connect from: {}", _addr);
-                            api.stat_connecting()?;
+                            api.stat_connecting().await?;
                             // TODO: middleware to confirm acception
                             stream
                         },
                         Err(e) => {
                             warn!(target: logs::targets::SERVER, "Cannot accept connection. Error: {}", e);
-                            tx_events.send(server::Events::ServerError(Error::AcceptStream(format!("{}", e)))).map_err(|e| Error::Channel(e.to_string()))?;
+                            tx_events
+                                .send(server::Events::ServerError(Error::AcceptStream(format!("{}", e))))
+                                .await
+                                .map_err(|e| Error::Channel(e.to_string()))?;
                             continue;
                         }
                     };
-                    if let Err(e) = tx_tcp_stream.send(stream) {
+                    if let Err(e) = tx_tcp_stream.send(stream).await {
                         warn!(target: logs::targets::SERVER, "Cannot share stream. Error: {}", e);
-                        tx_events.send(server::Events::ServerError(Error::AcceptStream(format!("{}", e)))).map_err(|e| Error::Channel(e.to_string()))?;
+                        tx_events
+                            .send(server::Events::ServerError(Error::AcceptStream(format!("{}", e))))
+                            .await
+                            .map_err(|e| Error::Channel(e.to_string()))?;
                         return Err(Error::AcceptStream(format!("{}", e)));
                     }
                 }
@@ -649,14 +693,14 @@ impl Server {
             }
         };
         drop(listener);
-        api.stat_listener_destroyed()?;
+        api.stat_listener_destroyed().await?;
         res
     }
 
     async fn accepting_task(
         &self,
-        tx_messages: UnboundedSender<Messages>,
-        mut rx_tcp_stream: UnboundedReceiver<TcpStream>,
+        tx_messages: Sender<Messages>,
+        mut rx_tcp_stream: Receiver<TcpStream>,
         monitor: Option<MonitorSender>,
         cancel: CancellationToken,
     ) -> Result<(), Error> {
@@ -683,7 +727,7 @@ impl Server {
                         Ok(control) => control,
                         Err(e) => {
                             warn!(target: logs::targets::SERVER, "Cannot create ws connection. Error: {}", e);
-                            tx_events.send(server::Events::ServerError(Error::CreateWS(e.to_string()))).map_err(|e| Error::Channel(e.to_string()))?;
+                            tx_events.send(server::Events::ServerError(Error::CreateWS(e.to_string()))).await.map_err(|e| Error::Channel(e.to_string()))?;
                             continue;
                         }
                     };
@@ -700,7 +744,7 @@ impl Server {
 
     async fn messages_task(
         &self,
-        mut rx_messages: UnboundedReceiver<Messages>,
+        mut rx_messages: Receiver<Messages>,
         cancel: CancellationToken,
     ) -> Result<(), Error> {
         let tx_events = self.tx_events.clone();
@@ -714,15 +758,15 @@ impl Server {
                     }
                     match msg {
                         Messages::Binary { uuid, buffer } => {
-                            api.stat_recieved_bytes(buffer.len())?;
-                            tx_events.send(server::Events::Received(uuid, buffer)).map_err(|e| Error::Channel(e.to_string()))?;
+                            api.stat_recieved_bytes(buffer.len()).await?;
+                            tx_events.send(server::Events::Received(uuid, buffer)).await.map_err(|e| Error::Channel(e.to_string()))?;
                         },
                         Messages::Disconnect { uuid, code } => {
                             debug!(target: logs::targets::SERVER, "{}:: Client wants to disconnect (code: {:?})", uuid, code);
                             api.remove_control(uuid).await?;
                         },
                         Messages::Error { uuid, error } => {
-                            tx_events.send(server::Events::Error(Some(uuid), format!("{:?}", error).to_string())).map_err(|e| Error::Channel(e.to_string()))?;
+                            tx_events.send(server::Events::Error(Some(uuid), format!("{:?}", error).to_string())).await.map_err(|e| Error::Channel(e.to_string()))?;
                         }
                     }
                 }
@@ -738,7 +782,7 @@ impl Server {
     async fn distributor_task(
         &self,
         options: Distributor,
-        tx_tcp_stream: UnboundedSender<TcpStream>,
+        tx_tcp_stream: Sender<TcpStream>,
         mut rx_port_request: PortReceiver,
         mut rx_monitor: MonitorReceiver,
         cancel: CancellationToken,
@@ -747,9 +791,9 @@ impl Server {
         let api = self.api.clone();
         let tx_events = self.tx_events.clone();
         let (tx_create_listener, mut rx_create_listener): (
-            UnboundedSender<CreatePortListenerRequest>,
-            UnboundedReceiver<CreatePortListenerRequest>,
-        ) = unbounded_channel();
+            Sender<CreatePortListenerRequest>,
+            Receiver<CreatePortListenerRequest>,
+        ) = channel(channels::PORT_REQUESTING);
         let result = select! {
             res = async {
                 while let Some(tx_response) = rx_port_request.recv().await {
@@ -767,7 +811,7 @@ impl Server {
                         let mut port: Option<u16> = api.delegate_port().await?;
                         if let Some(port_value) = port.as_ref() {
                             let (tx_listener_ready, rx_listener_ready): (oneshot::Sender<()>, oneshot::Receiver<()>) = oneshot::channel();
-                            tx_create_listener.send((port_value.to_owned(), tx_listener_ready)).map_err(|e| Error::Distributing(format!("fail to create new listener: {}", e)))?;
+                            tx_create_listener.send((port_value.to_owned(), tx_listener_ready)).await.map_err(|e| Error::Distributing(format!("fail to create new listener: {}", e)))?;
                             if let Err(err) = rx_listener_ready.await {
                                 error!(target: logs::targets::SERVER, "fail to get response from listener: {:?}", err);
                                 port = None;
@@ -839,7 +883,7 @@ impl Server {
                     target: logs::targets::SERVER,
                     "available port has been requested"
                 );
-                if let Err(_err) = tx_port_request.send(tx_port_response) {
+                if tx_port_request.send(tx_port_response).await.is_err() {
                     error!(target: logs::targets::SERVER, "fail request available port");
                     response(StatusCode::NO_CONTENT, String::from("error"))
                 } else if let Ok(port) = rx_port_response.await {
@@ -888,6 +932,7 @@ impl Server {
         let graceful = server.with_graceful_shutdown(async { cancel.cancelled().await });
         self.tx_events
             .send(server::Events::Ready)
+            .await
             .map_err(|e| Error::Channel(e.to_string()))?;
         graceful
             .await
@@ -902,12 +947,10 @@ impl Server {
             "[main]: will create main task"
         );
         info!(target: logs::targets::SERVER, "[main]: runtime is created");
-        let (tx_tcp_stream, rx_tcp_stream): (
-            UnboundedSender<TcpStream>,
-            UnboundedReceiver<TcpStream>,
-        ) = unbounded_channel();
-        let (tx_messages, rx_messages): (UnboundedSender<Messages>, UnboundedReceiver<Messages>) =
-            unbounded_channel();
+        let (tx_tcp_stream, rx_tcp_stream): (Sender<TcpStream>, Receiver<TcpStream>) =
+            channel(channels::INCOME_STREAMS);
+        let (tx_messages, rx_messages): (Sender<Messages>, Receiver<Messages>) =
+            channel(channels::MESSAGES_CHANNEL);
         let cancel = self.api.shutdown.clone();
         let rx_api = if let Some(rx_api) = self.rx_api.take() {
             rx_api
@@ -930,6 +973,7 @@ impl Server {
         );
         tx_events
             .send(server::Events::Shutdown)
+            .await
             .map_err(|err| Error::Channel(err.to_string()))?;
         if let Err(err) = api_task {
             error!(
@@ -972,14 +1016,13 @@ impl Server {
             "[main]: will create main task"
         );
         info!(target: logs::targets::SERVER, "[main]: runtime is created");
-        let (tx_tcp_stream, rx_tcp_stream): (
-            UnboundedSender<TcpStream>,
-            UnboundedReceiver<TcpStream>,
-        ) = unbounded_channel();
-        let (tx_port_request, rx_port_request): (PortSender, PortReceiver) = unbounded_channel();
-        let (tx_messages, rx_messages): (UnboundedSender<Messages>, UnboundedReceiver<Messages>) =
-            unbounded_channel();
-        let (tx_monitor, rx_monitor): (MonitorSender, MonitorReceiver) = unbounded_channel();
+        let (tx_tcp_stream, rx_tcp_stream): (Sender<TcpStream>, Receiver<TcpStream>) =
+            channel(channels::INCOME_STREAMS);
+        let (tx_port_request, rx_port_request): (PortSender, PortReceiver) =
+            channel(channels::PORT_REQUESTING);
+        let (tx_messages, rx_messages): (Sender<Messages>, Receiver<Messages>) =
+            channel(channels::MESSAGES_CHANNEL);
+        let (tx_monitor, rx_monitor): (MonitorSender, MonitorReceiver) = channel(channels::MONITOR);
         let cancel = self.api.shutdown.clone();
         let rx_api = if let Some(rx_api) = self.rx_api.take() {
             rx_api
@@ -1007,6 +1050,7 @@ impl Server {
         );
         tx_events
             .send(server::Events::Shutdown)
+            .await
             .map_err(|err| Error::Channel(err.to_string()))?;
         if let Err(err) = api_task {
             error!(
@@ -1061,7 +1105,7 @@ impl server::Impl<Error, Control> for Server {
         }
     }
 
-    fn observer(&mut self) -> Result<UnboundedReceiver<server::Events<Error>>, Error> {
+    fn observer(&mut self) -> Result<Receiver<server::Events<Error>>, Error> {
         if let Some(rx_events) = self.rx_events.take() {
             Ok(rx_events)
         } else {

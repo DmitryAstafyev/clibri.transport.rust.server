@@ -1,7 +1,7 @@
 use super::{
     channel::{Control, Error as ChannelError, Messages},
     errors::Error,
-    server::MonitorEvent,
+    server::{channels, MonitorEvent, MonitorSender},
 };
 use clibri::{env::logs, server};
 use futures::{SinkExt, StreamExt};
@@ -11,7 +11,7 @@ use tokio::{
     net::TcpStream,
     select,
     sync::{
-        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        mpsc::{channel, Receiver, Sender},
         oneshot,
     },
     task::spawn,
@@ -26,6 +26,51 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+mod shortcuts {
+    use super::*;
+
+    pub async fn send_event(
+        tx_events: &Sender<server::Events<Error>>,
+        event: server::Events<Error>,
+    ) {
+        if let Err(e) = tx_events.send(event).await {
+            warn!(
+                target: logs::targets::SERVER,
+                "Cannot send event. Error: {}", e
+            );
+        }
+    }
+
+    pub async fn send_message(
+        tx_events: &Sender<server::Events<Error>>,
+        tx_messages: &Sender<Messages>,
+        msg: Messages,
+        uuid: Uuid,
+    ) {
+        match tx_messages.send(msg).await {
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    target: logs::targets::SERVER,
+                    "{}:: Fail to send data back to server. Error: {}", uuid, e
+                );
+                if let Err(e) = tx_events
+                    .send(server::Events::ConnectionError(
+                        Some(uuid),
+                        Error::Channel(format!("{}", e)),
+                    ))
+                    .await
+                {
+                    warn!(
+                        target: logs::targets::SERVER,
+                        "Cannot send event. Error: {}", e
+                    );
+                }
+            }
+        }
+    }
+}
 
 enum State {
     DisconnectByClient(Option<CloseFrame<'static>>),
@@ -46,48 +91,20 @@ impl Connection {
     pub async fn attach(
         &mut self,
         ws: WebSocketStream<TcpStream>,
-        events: UnboundedSender<server::Events<Error>>,
-        messages: UnboundedSender<Messages>,
-        monitor: Option<UnboundedSender<(u16, MonitorEvent)>>,
+        tx_events: Sender<server::Events<Error>>,
+        tx_messages: Sender<Messages>,
+        monitor: Option<MonitorSender>,
         port: u16,
-    ) -> Result<UnboundedSender<Control>, String> {
-        let (tx_control, mut rx_control): (UnboundedSender<Control>, UnboundedReceiver<Control>) =
-            unbounded_channel();
+    ) -> Result<Sender<Control>, String> {
+        let (tx_control, mut rx_control): (Sender<Control>, Receiver<Control>) =
+            channel(channels::CONNECTION_CONTROL);
         let uuid = self.uuid;
-        let incomes_task_events = events.clone();
-        let send_event = move |event: server::Events<Error>| {
-            if let Err(e) = incomes_task_events.send(event) {
-                warn!(
-                    target: logs::targets::SERVER,
-                    "Cannot send event. Error: {}", e
-                );
-            }
-        };
         if let Some(monitor) = monitor.as_ref() {
             monitor
                 .send((port, MonitorEvent::Connected))
+                .await
                 .map_err(|_e| String::from("Fail send monitor event - connected"))?;
         }
-        let send_message = move |msg: Messages| {
-            match messages.send(msg) {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(
-                        target: logs::targets::SERVER,
-                        "{}:: Fail to send data back to server. Error: {}", uuid, e
-                    );
-                    if let Err(e) = events.send(server::Events::ConnectionError(
-                        Some(uuid),
-                        Error::Channel(format!("{}", e)),
-                    )) {
-                        warn!(
-                            target: logs::targets::SERVER,
-                            "Cannot send event. Error: {}", e
-                        );
-                    }
-                }
-            };
-        };
         spawn(async move {
             let mut shutdown_resolver: Option<oneshot::Sender<()>> = None;
             let (mut writer, mut reader) = ws.split();
@@ -124,10 +141,14 @@ impl Connection {
                                     target: logs::targets::SERVER,
                                     "{}:: Cannot get message. Error: {:?}", uuid, err
                                 );
-                                send_event(server::Events::ConnectionError(
-                                    Some(uuid),
-                                    Error::InvalidMessage(err.to_string()),
-                                ));
+                                shortcuts::send_event(
+                                    &tx_events,
+                                    server::Events::ConnectionError(
+                                        Some(uuid),
+                                        Error::InvalidMessage(err.to_string()),
+                                    ),
+                                )
+                                .await;
                                 stop_writing_emitter.cancel();
                                 return (
                                     reader,
@@ -141,10 +162,14 @@ impl Connection {
                                     target: logs::targets::SERVER,
                                     "{}:: has been gotten not binnary data", uuid
                                 );
-                                send_event(server::Events::ConnectionError(
-                                    Some(uuid),
-                                    Error::NonBinaryData,
-                                ));
+                                shortcuts::send_event(
+                                    &tx_events,
+                                    server::Events::ConnectionError(
+                                        Some(uuid),
+                                        Error::NonBinaryData,
+                                    ),
+                                )
+                                .await;
                                 continue;
                             }
                             Message::Binary(buffer) => {
@@ -152,7 +177,13 @@ impl Connection {
                                     target: logs::targets::SERVER,
                                     "{}:: binary data {:?}", uuid, buffer
                                 );
-                                send_message(Messages::Binary { uuid, buffer });
+                                shortcuts::send_message(
+                                    &tx_events,
+                                    &tx_messages,
+                                    Messages::Binary { uuid, buffer },
+                                    uuid,
+                                )
+                                .await;
                             }
                             Message::Ping(_) | Message::Pong(_) => {
                                 warn!(target: logs::targets::SERVER, "{}:: Ping / Pong", uuid);
@@ -198,7 +229,6 @@ impl Connection {
                     (writer, None)
                 }
             );
-
             debug!(
                 target: logs::targets::SERVER,
                 "{}:: exit from socket listening loop.", uuid
@@ -211,27 +241,51 @@ impl Connection {
             if let Some(state) = state {
                 match state {
                     State::DisconnectByServer => {
-                        send_message(Messages::Disconnect { uuid, code: None });
+                        shortcuts::send_message(
+                            &tx_events,
+                            &tx_messages,
+                            Messages::Disconnect { uuid, code: None },
+                            uuid,
+                        )
+                        .await;
                     }
                     State::DisconnectByClient(frame) => {
-                        send_message(Messages::Disconnect {
-                            uuid,
-                            code: if let Some(frame) = frame {
-                                Some(frame.code)
-                            } else {
-                                None
+                        shortcuts::send_message(
+                            &tx_events,
+                            &tx_messages,
+                            Messages::Disconnect {
+                                uuid,
+                                code: if let Some(frame) = frame {
+                                    Some(frame.code)
+                                } else {
+                                    None
+                                },
                             },
-                        });
+                            uuid,
+                        )
+                        .await;
                     }
                     State::DisconnectByClientWithError(e) => {
                         debug!(
                             target: logs::targets::SERVER,
                             "{}:: client error: {}", uuid, e
                         );
-                        send_message(Messages::Disconnect { uuid, code: None });
+                        shortcuts::send_message(
+                            &tx_events,
+                            &tx_messages,
+                            Messages::Disconnect { uuid, code: None },
+                            uuid,
+                        )
+                        .await;
                     }
                     State::Error(error) => {
-                        send_message(Messages::Error { uuid, error });
+                        shortcuts::send_message(
+                            &tx_events,
+                            &tx_messages,
+                            Messages::Error { uuid, error },
+                            uuid,
+                        )
+                        .await;
                     }
                 };
             }
@@ -252,13 +306,17 @@ impl Connection {
                                     target: logs::targets::SERVER,
                                     "{}:: fail to close connection", uuid
                                 );
-                                send_event(server::Events::ConnectionError(
-                                    Some(uuid),
-                                    Error::CloseConnection(format!(
-                                        "{}:: fail to close connection",
-                                        uuid
-                                    )),
-                                ));
+                                shortcuts::send_event(
+                                    &tx_events,
+                                    server::Events::ConnectionError(
+                                        Some(uuid),
+                                        Error::CloseConnection(format!(
+                                            "{}:: fail to close connection",
+                                            uuid
+                                        )),
+                                    ),
+                                )
+                                .await;
                             }
                         },
                     };
@@ -269,17 +327,21 @@ impl Connection {
                         target: logs::targets::SERVER,
                         "{}:: fail to close connection (reunite err: {})", uuid, err
                     );
-                    send_event(server::Events::ConnectionError(
-                        Some(uuid),
-                        Error::CloseConnection(format!(
-                            "{}:: fail to close connection (reunite err: {})",
-                            uuid, err
-                        )),
-                    ));
+                    shortcuts::send_event(
+                        &tx_events,
+                        server::Events::ConnectionError(
+                            Some(uuid),
+                            Error::CloseConnection(format!(
+                                "{}:: fail to close connection (reunite err: {})",
+                                uuid, err
+                            )),
+                        ),
+                    )
+                    .await;
                 }
             }
             if let Some(monitor) = monitor.as_ref() {
-                if let Err(_err) = monitor.send((port, MonitorEvent::Disconnected)) {
+                if let Err(_err) = monitor.send((port, MonitorEvent::Disconnected)).await {
                     error!(
                         target: logs::targets::SERVER,
                         "{}:: Fail send monitor event - disconnected", uuid
