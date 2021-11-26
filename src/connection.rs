@@ -11,7 +11,7 @@ use tokio::{
     net::TcpStream,
     select,
     sync::{
-        mpsc::{channel, Receiver, Sender},
+        mpsc::{channel, Receiver, Sender, UnboundedSender},
         oneshot,
     },
     task::spawn,
@@ -31,10 +31,10 @@ mod shortcuts {
     use super::*;
 
     pub async fn send_event(
-        tx_events: &Sender<server::Events<Error>>,
+        tx_events: &UnboundedSender<server::Events<Error>>,
         event: server::Events<Error>,
     ) {
-        if let Err(e) = tx_events.send(event).await {
+        if let Err(e) = tx_events.send(event) {
             warn!(
                 target: logs::targets::SERVER,
                 "Cannot send event. Error: {}", e
@@ -43,25 +43,22 @@ mod shortcuts {
     }
 
     pub async fn send_message(
-        tx_events: &Sender<server::Events<Error>>,
-        tx_messages: &Sender<Messages>,
+        tx_events: &UnboundedSender<server::Events<Error>>,
+        tx_messages: &UnboundedSender<Messages>,
         msg: Messages,
         uuid: Uuid,
     ) {
-        match tx_messages.send(msg).await {
+        match tx_messages.send(msg) {
             Ok(_) => {}
             Err(e) => {
                 warn!(
                     target: logs::targets::SERVER,
                     "{}:: Fail to send data back to server. Error: {}", uuid, e
                 );
-                if let Err(e) = tx_events
-                    .send(server::Events::ConnectionError(
-                        Some(uuid),
-                        Error::Channel(format!("{}", e)),
-                    ))
-                    .await
-                {
+                if let Err(e) = tx_events.send(server::Events::ConnectionError(
+                    Some(uuid),
+                    Error::Channel(format!("{}", e)),
+                )) {
                     warn!(
                         target: logs::targets::SERVER,
                         "Cannot send event. Error: {}", e
@@ -91,8 +88,8 @@ impl Connection {
     pub async fn attach(
         &mut self,
         ws: WebSocketStream<TcpStream>,
-        tx_events: Sender<server::Events<Error>>,
-        tx_messages: Sender<Messages>,
+        tx_events: UnboundedSender<server::Events<Error>>,
+        tx_messages: UnboundedSender<Messages>,
         monitor: Option<MonitorSender>,
         port: u16,
     ) -> Result<Sender<Control>, String> {
