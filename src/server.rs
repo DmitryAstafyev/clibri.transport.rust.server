@@ -504,16 +504,22 @@ impl Server {
                                     if let Err(e) = control.send(ConnectionControl::Send(buffer)).await {
                                         error!(target: logs::targets::SERVER, "{}:: Fail to close connection due error: {}", uuid, e);
                                         tx_events.send(server::Events::Error(Some(uuid), format!("{}", e))).map_err(|e| Error::Channel(e.to_string()))?;
+                                        shortcuts::remove_control(&mut controlls, &tx_events, &mut stat, uuid.to_owned()).await?;
                                     } else { stat.sent_bytes(len); }
                                 } else {
                                     error!(target: logs::targets::SERVER, "Fail to find a client {}", uuid);
                                 }
                             } else {
+                                let mut to_be_removed: Vec<Uuid> = vec![];
                                 for (uuid, control) in controlls.iter_mut() {
                                     if let Err(e) = control.send(ConnectionControl::Send(buffer.clone())).await {
                                         error!(target: logs::targets::SERVER, "{}:: Fail to close connection due error: {}", uuid, e);
                                         tx_events.send(server::Events::Error(Some(*uuid), format!("{}", e))).map_err(|e| Error::Channel(e.to_string()))?;
+                                        to_be_removed.push(*uuid);
                                     } else { stat.sent_bytes(len); }
+                                }
+                                for uuid in to_be_removed {
+                                    shortcuts::remove_control(&mut controlls, &tx_events, &mut stat, uuid.to_owned()).await?;
                                 }
                             }
                             tx_resolve.send(()).map_err(|_| {

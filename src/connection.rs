@@ -235,45 +235,22 @@ impl Connection {
             } else {
                 writer_state
             };
-            if let Some(state) = state {
+            let code = if let Some(state) = state {
                 match state {
-                    State::DisconnectByServer => {
-                        shortcuts::send_message(
-                            &tx_events,
-                            &tx_messages,
-                            Messages::Disconnect { uuid, code: None },
-                            uuid,
-                        )
-                        .await;
-                    }
+                    State::DisconnectByServer => None,
                     State::DisconnectByClient(frame) => {
-                        shortcuts::send_message(
-                            &tx_events,
-                            &tx_messages,
-                            Messages::Disconnect {
-                                uuid,
-                                code: if let Some(frame) = frame {
-                                    Some(frame.code)
-                                } else {
-                                    None
-                                },
-                            },
-                            uuid,
-                        )
-                        .await;
+                        if let Some(frame) = frame {
+                            Some(frame.code)
+                        } else {
+                            None
+                        }
                     }
                     State::DisconnectByClientWithError(e) => {
                         debug!(
                             target: logs::targets::SERVER,
                             "{}:: client error: {}", uuid, e
                         );
-                        shortcuts::send_message(
-                            &tx_events,
-                            &tx_messages,
-                            Messages::Disconnect { uuid, code: None },
-                            uuid,
-                        )
-                        .await;
+                        None
                     }
                     State::Error(error) => {
                         shortcuts::send_message(
@@ -283,9 +260,19 @@ impl Connection {
                             uuid,
                         )
                         .await;
+                        None
                     }
-                };
-            }
+                }
+            } else {
+                None
+            };
+            shortcuts::send_message(
+                &tx_events,
+                &tx_messages,
+                Messages::Disconnect { uuid, code },
+                uuid,
+            )
+            .await;
             match writer.reunite(reader) {
                 Ok(mut ws) => {
                     match ws.close(None).await {
