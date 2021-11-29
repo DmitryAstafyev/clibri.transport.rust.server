@@ -1,6 +1,7 @@
-use thiserror::Error;
+use clibri::server;
+use thiserror::Error as ThisError;
 
-#[derive(Error, Debug, Clone)]
+#[derive(ThisError, Debug, Clone)]
 pub enum Error {
 	#[error("creating server error: `{0}`")]
 	Create(String),
@@ -33,3 +34,5 @@ pub enum Error {
 	#[error("fail to parse string to SocketAddr: `{0}`")]
 	SocketAddr(String),
 }
+
+impl server::Error for Error {}
