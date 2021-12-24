@@ -382,14 +382,20 @@ impl Server {
                     match msg {
                         InternalChannel::GetPort(tx_resolve) => {
                             if let Some(options) = options.as_ref() {
-                                tx_resolve
-                                .send(connections.iter().find_map(|(port, (count, _cancel))| {
+                                let port = connections.iter().find_map(|(port, (count, _cancel))| {
                                     if count < &options.connections_per_port {
                                         Some(port.to_owned())
                                     } else {
                                         None
                                     }
-                                }))
+                                });
+                                if let Some(port) = port {
+                                    if let Some((count, _cancel)) = connections.get_mut(&port) {
+                                        *count += 1;
+                                    }
+                                }
+                                tx_resolve
+                                .send(port)
                                 .map_err(|_| {
                                     Error::Channel(String::from(
                                         "Fail handle InternalChannel::GetPort command",
@@ -457,9 +463,9 @@ impl Server {
                         InternalChannel::MonitorEvent(event, port, tx_resolve) => {
                             match event {
                                 MonitorEvent::Connected => {
-                                    if let Some((count, _cancel)) = connections.get_mut(&port) {
-                                        *count += 1;
-                                    }
+                                    // if let Some((count, _cancel)) = connections.get_mut(&port) {
+                                    //     *count += 1;
+                                    // }
                                 }
                                 MonitorEvent::Disconnected => {
                                     if let Some((count, cancel)) = connections.get_mut(&port) {
