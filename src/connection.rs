@@ -48,22 +48,19 @@ mod shortcuts {
         msg: Messages,
         uuid: Uuid,
     ) {
-        match tx_messages.send(msg) {
-            Ok(_) => {}
-            Err(e) => {
+        if let Err(err) = tx_messages.send(msg) {
+            warn!(
+                target: logs::targets::SERVER,
+                "{}:: Fail to send data back to server. Error: {}", uuid, err
+            );
+            if let Err(err) = tx_events.send(server::Events::ConnectionError(
+                Some(uuid),
+                Error::Channel(format!("{}", err)),
+            )) {
                 warn!(
                     target: logs::targets::SERVER,
-                    "{}:: Fail to send data back to server. Error: {}", uuid, e
+                    "Cannot send event. Error: {}", err
                 );
-                if let Err(e) = tx_events.send(server::Events::ConnectionError(
-                    Some(uuid),
-                    Error::Channel(format!("{}", e)),
-                )) {
-                    warn!(
-                        target: logs::targets::SERVER,
-                        "Cannot send event. Error: {}", e
-                    );
-                }
             }
         }
     }
@@ -90,14 +87,14 @@ impl Connection {
         ws: WebSocketStream<TcpStream>,
         tx_events: UnboundedSender<server::Events<Error>>,
         tx_messages: UnboundedSender<Messages>,
-        monitor: Option<MonitorSender>,
+        tx_monitor: Option<MonitorSender>,
         port: u16,
     ) -> Result<Sender<Control>, String> {
         let (tx_control, mut rx_control): (Sender<Control>, Receiver<Control>) =
             channel(channels::CONNECTION_CONTROL);
         let uuid = self.uuid;
-        if let Some(monitor) = monitor.as_ref() {
-            monitor
+        if let Some(tx_monitor) = tx_monitor.as_ref() {
+            tx_monitor
                 .send((port, MonitorEvent::Connected))
                 .await
                 .map_err(|_e| String::from("Fail send monitor event - connected"))?;
@@ -324,9 +321,9 @@ impl Connection {
                     .await;
                 }
             }
-            if let Some(monitor) = monitor.as_ref() {
-                if let Err(_err) = monitor.send((port, MonitorEvent::Disconnected)).await {
-                    error!(
+            if let Some(tx_monitor) = tx_monitor.as_ref() {
+                if let Err(_err) = tx_monitor.send((port, MonitorEvent::Disconnected)).await {
+                    warn!(
                         target: logs::targets::SERVER,
                         "{}:: Fail send monitor event - disconnected", uuid
                     );

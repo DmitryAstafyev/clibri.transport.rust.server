@@ -89,7 +89,6 @@ impl server::Control<Error> for Control {
             target: logs::targets::SERVER,
             "server::Control::Shutdown has been called"
         );
-        self.api.lock();
         self.api.disconnect_all().await?;
         if server_env::is_debug_mode() {
             if let Err(err) = self.api.print_stat().await {
@@ -230,6 +229,9 @@ impl InternalAPI {
     }
 
     pub async fn disconnect_all(&self) -> Result<(), Error> {
+        if !self.is_locked() {
+            self.locked.cancel();
+        }
         let (tx_resolve, rx_resolve): (oneshot::Sender<()>, oneshot::Receiver<()>) =
             oneshot::channel();
         self.tx_api
@@ -288,12 +290,6 @@ impl InternalAPI {
 
     pub fn shutdown(&self) {
         self.shutdown.cancel();
-    }
-
-    pub fn lock(&self) {
-        if !self.is_locked() {
-            self.locked.cancel();
-        }
     }
 
     pub fn is_locked(&self) -> bool {
@@ -692,7 +688,7 @@ impl Server {
         &self,
         tx_messages: UnboundedSender<Messages>,
         mut rx_tcp_stream: Receiver<TcpStream>,
-        monitor: Option<MonitorSender>,
+        tx_monitor: Option<MonitorSender>,
         cancel: CancellationToken,
     ) -> Result<(), Error> {
         let tx_events = self.tx_events.clone();
@@ -714,7 +710,7 @@ impl Server {
                     };
                     debug!(target: logs::targets::SERVER, "Connection has been accepted");
                     let uuid = Uuid::new_v4();
-                    let control = match Connection::new(uuid).attach(ws, tx_events.clone(), tx_messages.clone(), monitor.clone(), port).await {
+                    let control = match Connection::new(uuid).attach(ws, tx_events.clone(), tx_messages.clone(), tx_monitor.clone(), port).await {
                         Ok(control) => control,
                         Err(e) => {
                             warn!(target: logs::targets::SERVER, "Cannot create ws connection. Error: {}", e);
@@ -785,72 +781,119 @@ impl Server {
             Sender<CreatePortListenerRequest>,
             Receiver<CreatePortListenerRequest>,
         ) = channel(channels::PORT_REQUESTING);
-        let result = select! {
-            res = async {
+        let (port_request, listener_creator, monitor) = join!(
+            async {
                 while let Some(tx_response) = rx_port_request.recv().await {
                     if api.is_locked() {
                         continue;
                     }
-                    info!(target: logs::targets::SERVER, "request for available port is gotten");
+                    info!(
+                        target: logs::targets::SERVER,
+                        "request for available port is gotten"
+                    );
                     let mut port = api.get_port().await?;
                     if let Some(port) = port.take() {
                         if let Err(err) = tx_response.send(Some(port)) {
-                            error!(target: logs::targets::SERVER, "fail to send response about available port: {:?}", err);
+                            error!(
+                                target: logs::targets::SERVER,
+                                "fail to send response about available port: {:?}", err
+                            );
                         }
                     } else {
-                        info!(target: logs::targets::SERVER, "no open sockets has been found");
+                        info!(
+                            target: logs::targets::SERVER,
+                            "no open sockets has been found"
+                        );
                         let mut port: Option<u16> = api.delegate_port().await?;
                         if let Some(port_value) = port.as_ref() {
-                            let (tx_listener_ready, rx_listener_ready): (oneshot::Sender<()>, oneshot::Receiver<()>) = oneshot::channel();
-                            tx_create_listener.send((port_value.to_owned(), tx_listener_ready)).await.map_err(|e| Error::Distributing(format!("fail to create new listener: {}", e)))?;
+                            let (tx_listener_ready, rx_listener_ready): (
+                                oneshot::Sender<()>,
+                                oneshot::Receiver<()>,
+                            ) = oneshot::channel();
+                            tx_create_listener
+                                .send((port_value.to_owned(), tx_listener_ready))
+                                .await
+                                .map_err(|e| {
+                                    Error::Distributing(format!(
+                                        "fail to create new listener: {}",
+                                        e
+                                    ))
+                                })?;
                             if let Err(err) = rx_listener_ready.await {
-                                error!(target: logs::targets::SERVER, "fail to get response from listener: {:?}", err);
+                                error!(
+                                    target: logs::targets::SERVER,
+                                    "fail to get response from listener: {:?}", err
+                                );
                                 port = None;
                             }
                         }
                         if let Err(err) = tx_response.send(port) {
-                            warn!(target: logs::targets::SERVER, "fail to response on port request: {:?}", err);
+                            warn!(
+                                target: logs::targets::SERVER,
+                                "fail to response on port request: {:?}", err
+                            );
                         }
                     }
                 }
                 Ok::<(), Error>(())
-            } => res,
-            res = async {
+            },
+            async {
                 while let Some((port, tx_listener_ready)) = rx_create_listener.recv().await {
                     if api.is_locked() {
                         continue;
                     }
-                    let socket_addr = format!("{}:{}", addr, port).parse::<SocketAddr>().map_err(|e| Error::SocketAddr(e.to_string()))?;
+                    let socket_addr = format!("{}:{}", addr, port)
+                        .parse::<SocketAddr>()
+                        .map_err(|e| Error::SocketAddr(e.to_string()))?;
                     let tx_events = tx_events.clone();
                     let api = api.clone();
                     let tx_tcp_stream = tx_tcp_stream.clone();
                     let close_child_token = cancel.child_token();
                     api.insert(port, (0, close_child_token.clone())).await?;
                     task::spawn(async move {
-                        debug!(target: logs::targets::SERVER, "streams tasks for port {} created", port);
+                        debug!(
+                            target: logs::targets::SERVER,
+                            "streams tasks for port {} created", port
+                        );
                         if let Err(err) = Self::streams_task(
                             socket_addr,
                             tx_tcp_stream,
                             tx_events,
                             api,
                             Some(tx_listener_ready),
-                            close_child_token
-                        ).await {
-                            warn!(target: logs::targets::SERVER, "streams tasks is finished with error: {:?}", err);
+                            close_child_token,
+                        )
+                        .await
+                        {
+                            warn!(
+                                target: logs::targets::SERVER,
+                                "streams tasks is finished with error: {:?}", err
+                            );
                         }
-                        debug!(target: logs::targets::SERVER, "streams tasks for port {} destroyed", port);
+                        debug!(
+                            target: logs::targets::SERVER,
+                            "streams tasks for port {} destroyed", port
+                        );
                     });
                 }
                 Ok::<(), Error>(())
-            } => res,
-            res = async {
+            },
+            async {
                 while let Some((port, event)) = rx_monitor.recv().await {
                     api.monitor_event(port, event).await?;
                 }
                 Ok::<(), Error>(())
-            } => res,
-        };
-        result
+            }
+        );
+        if let Err(err) = port_request {
+            Err(err)
+        } else if let Err(err) = listener_creator {
+            Err(err)
+        } else if let Err(err) = monitor {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     async fn http_response(
