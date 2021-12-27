@@ -33,6 +33,8 @@ pub enum Error {
 	Distributing(String),
 	#[error("fail to parse string to SocketAddr: `{0}`")]
 	SocketAddr(String),
+	#[error("options required: `{0}`")]
+	NoOptions(String),
 }
 
 impl server::Error for Error {}

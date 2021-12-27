@@ -11,6 +11,7 @@ pub mod errors;
 #[path = "./connection.handshake.rs"]
 pub mod handshake;
 pub mod options;
+pub mod ports;
 pub mod server;
 #[path = "./server.stat.rs"]
 pub mod stat;

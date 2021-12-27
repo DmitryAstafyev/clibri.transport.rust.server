@@ -4,7 +4,8 @@ use super::{
     env as server_env,
     errors::Error,
     handshake::Handshake as HandshakeInterface,
-    options::{Distributor, Listener, Options, Ports},
+    options::{Distributor, Listener, Options},
+    ports,
     stat::Stat,
 };
 use async_trait::async_trait;
@@ -59,7 +60,7 @@ impl HandshakeInterface for Handshake {}
 enum InternalChannel {
     GetPort(oneshot::Sender<Option<u16>>),
     DelegatePort(oneshot::Sender<Option<u16>>),
-    Insert(u16, (u32, CancellationToken), oneshot::Sender<()>),
+    Insert(u16, CancellationToken, oneshot::Sender<()>),
     MonitorEvent(MonitorEvent, u16, oneshot::Sender<()>),
     InsertControl(Uuid, Sender<ConnectionControl>, oneshot::Sender<()>),
     RemoveControl(Uuid, oneshot::Sender<()>),
@@ -146,11 +147,11 @@ impl InternalAPI {
         })
     }
 
-    pub async fn insert(&self, port: u16, data: (u32, CancellationToken)) -> Result<(), Error> {
+    pub async fn insert(&self, port: u16, cancel: CancellationToken) -> Result<(), Error> {
         let (tx_resolve, rx_resolve): (oneshot::Sender<()>, oneshot::Receiver<()>) =
             oneshot::channel();
         self.tx_api
-            .send(InternalChannel::Insert(port, data, tx_resolve))
+            .send(InternalChannel::Insert(port, cancel, tx_resolve))
             .map_err(|e| Error::Channel(format!("Fail do api::insert; error: {}", e)))?;
         rx_resolve
             .await
@@ -367,7 +368,10 @@ impl Server {
         options: Option<Distributor>,
         cancel: CancellationToken,
     ) -> Result<(), Error> {
-        let mut connections: HashMap<u16, (u32, CancellationToken)> = HashMap::new();
+        let mut ports = ports::Ports::new(
+            options.as_ref().map(|options| options.connections_per_port),
+            options.as_ref().map(|options| options.ports.clone()),
+        );
         let mut controlls: HashMap<Uuid, Sender<ConnectionControl>> = HashMap::new();
         let mut stat: Stat = Stat::new();
         let tx_events = self.tx_events.clone();
@@ -377,79 +381,25 @@ impl Server {
                 while let Some(msg) = rx_api.recv().await {
                     match msg {
                         InternalChannel::GetPort(tx_resolve) => {
-                            if let Some(options) = options.as_ref() {
-                                let port = connections.iter().find_map(|(port, (count, _cancel))| {
-                                    if count < &options.connections_per_port {
-                                        Some(port.to_owned())
-                                    } else {
-                                        None
-                                    }
-                                });
-                                if let Some(port) = port {
-                                    if let Some((count, _cancel)) = connections.get_mut(&port) {
-                                        *count += 1;
-                                    }
-                                }
-                                tx_resolve
-                                .send(port)
+                            tx_resolve
+                                .send(ports.reserve()?)
                                 .map_err(|_| {
                                     Error::Channel(String::from(
                                         "Fail handle InternalChannel::GetPort command",
                                     ))
                                 })?;
-                            } else {
-                                return Err(Error::Channel(String::from(
-                                    "Fail handle InternalChannel::GetPort command: no options",
-                                )));
-                            }
                         }
                         InternalChannel::DelegatePort(tx_resolve) => {
-                            if let Some(options) = options.as_ref() {
-                                tx_resolve
-                                .send(match options.ports.clone() {
-                                    Ports::List(ports) => {
-                                        info!(
-                                            target: logs::targets::SERVER,
-                                            "looking for port from a list"
-                                        );
-                                        let mut free: Option<u16> = None;
-                                        for port in ports.iter() {
-                                            if !connections.contains_key(port) {
-                                                free = Some(port.to_owned());
-                                                break;
-                                            }
-                                        }
-                                        free
-                                    }
-                                    Ports::Range(range) => {
-                                        info!(
-                                            target: logs::targets::SERVER,
-                                            "looking for port from a range"
-                                        );
-                                        let mut free: Option<u16> = None;
-                                        for port in range {
-                                            if !connections.contains_key(&port) {
-                                                free = Some(port);
-                                                break;
-                                            }
-                                        }
-                                        free
-                                    }
-                                })
+                            tx_resolve
+                                .send(ports.delegate()?)
                                 .map_err(|_| {
                                     Error::Channel(String::from(
                                         "Fail handle InternalChannel::DelegatePort command",
                                     ))
                                 })?;
-                            } else {
-                                return Err(Error::Channel(String::from(
-                                    "Fail handle InternalChannel::DelegatePort command: no options",
-                                )));
-                            }
-
                         }
-                        InternalChannel::Insert(port, data, tx_resolve) => {
-                            connections.insert(port, data);
+                        InternalChannel::Insert(port, cancel, tx_resolve) => {
+                            ports.add(port, cancel);
                             tx_resolve.send(()).map_err(|_| {
                                 Error::Channel(String::from(
                                     "Fail handle InternalChannel::Insert command",
@@ -459,18 +409,10 @@ impl Server {
                         InternalChannel::MonitorEvent(event, port, tx_resolve) => {
                             match event {
                                 MonitorEvent::Connected => {
-                                    // if let Some((count, _cancel)) = connections.get_mut(&port) {
-                                    //     *count += 1;
-                                    // }
+                                    ports.confirm(port);
                                 }
                                 MonitorEvent::Disconnected => {
-                                    if let Some((count, cancel)) = connections.get_mut(&port) {
-                                        *count -= 1;
-                                        if count == &0 {
-                                            cancel.cancel();
-                                            connections.remove(&port);
-                                        }
-                                    }
+                                    ports.free(port);
                                 }
                             };
                             tx_resolve.send(()).map_err(|_| {
@@ -576,7 +518,7 @@ impl Server {
                                     "Fail handle InternalChannel::Disconnect command",
                                 ))
                             })?;
-                    }
+                        }
                         InternalChannel::PrintStat(tx_resolve) => {
                             stat.print();
                             tx_resolve.send(()).map_err(|_| {
@@ -680,7 +622,12 @@ impl Server {
             }
         };
         drop(listener);
-        api.stat_listener_destroyed().await?;
+        if let Err(err) = api.stat_listener_destroyed().await {
+            debug!(
+                target: logs::targets::SERVER,
+                "Fail to call destroy method for stat listener: {}", err
+            );
+        }
         res
     }
 
@@ -849,7 +796,7 @@ impl Server {
                     let api = api.clone();
                     let tx_tcp_stream = tx_tcp_stream.clone();
                     let close_child_token = cancel.child_token();
-                    api.insert(port, (0, close_child_token.clone())).await?;
+                    api.insert(port, close_child_token.clone()).await?;
                     task::spawn(async move {
                         debug!(
                             target: logs::targets::SERVER,
@@ -991,18 +938,25 @@ impl Server {
             return Err(Error::FailTakeAPI);
         };
         let tx_events = self.tx_events.clone();
-        let (streams_task, api_task, accepting_task, messages_task) = join!(
-            Self::streams_task(
-                addr,
-                tx_tcp_stream,
-                self.tx_events.clone(),
-                self.api.clone(),
-                None,
-                cancel.child_token()
-            ),
-            self.api_task(rx_api, None, cancel.child_token()),
-            self.accepting_task(tx_messages, rx_tcp_stream, None, cancel.child_token()),
-            self.messages_task(rx_messages, cancel.child_token()),
+        let cancel_api = CancellationToken::new();
+        let (api_task, (streams_task, accepting_task, messages_task)) = join!(
+            self.api_task(rx_api, None, cancel_api.child_token()),
+            async {
+                let (streams_task, accepting_task, messages_task) = join!(
+                    Self::streams_task(
+                        addr,
+                        tx_tcp_stream,
+                        self.tx_events.clone(),
+                        self.api.clone(),
+                        None,
+                        cancel.child_token()
+                    ),
+                    self.accepting_task(tx_messages, rx_tcp_stream, None, cancel.child_token()),
+                    self.messages_task(rx_messages, cancel.child_token()),
+                );
+                cancel_api.cancel();
+                (streams_task, accepting_task, messages_task)
+            }
         );
         tx_events
             .send(server::Events::Shutdown)
@@ -1062,23 +1016,30 @@ impl Server {
             return Err(Error::FailTakeAPI);
         };
         let tx_events = self.tx_events.clone();
-        let (http_task, api_task, distributor_task, accepting_task, messages_task) = join!(
-            self.api_task(rx_api, Some(options.clone()), cancel.child_token()),
-            self.http_task(options.distributor, tx_port_request, cancel.child_token()),
-            self.distributor_task(
-                options,
-                tx_tcp_stream,
-                rx_port_request,
-                rx_monitor,
-                cancel.child_token()
-            ),
-            self.accepting_task(
-                tx_messages,
-                rx_tcp_stream,
-                Some(tx_monitor),
-                cancel.child_token()
-            ),
-            self.messages_task(rx_messages, cancel.child_token()),
+        let cancel_api = CancellationToken::new();
+        let (api_task, (http_task, distributor_task, accepting_task, messages_task)) = join!(
+            self.api_task(rx_api, Some(options.clone()), cancel_api.child_token()),
+            async {
+                let (http_task, distributor_task, accepting_task, messages_task) = join!(
+                    self.http_task(options.distributor, tx_port_request, cancel.child_token()),
+                    self.distributor_task(
+                        options,
+                        tx_tcp_stream,
+                        rx_port_request,
+                        rx_monitor,
+                        cancel.child_token()
+                    ),
+                    self.accepting_task(
+                        tx_messages,
+                        rx_tcp_stream,
+                        Some(tx_monitor),
+                        cancel.child_token()
+                    ),
+                    self.messages_task(rx_messages, cancel.child_token()),
+                );
+                cancel_api.cancel();
+                (http_task, distributor_task, accepting_task, messages_task)
+            }
         );
         tx_events
             .send(server::Events::Shutdown)
